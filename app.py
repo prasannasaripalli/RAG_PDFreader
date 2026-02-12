@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import hashlib
 import streamlit as st
 import pandas as pd
@@ -11,38 +12,46 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 
+# to read from .env file locally
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # -----------------------------
 # 0) Page config MUST be first
 # -----------------------------
 st.set_page_config(page_title="RAG Test Case Generator", layout="wide")
-st.title("📄➡️✅ RAG Test Case Generator from PDFs")
-st.caption("Upload PDF(s), paste acceptance criteria, generate test cases using RAG (FAISS + OpenAI).")
+st.title("RAG Test Case Generator from PDFs")
+st.caption("Upload PDF(s), paste acceptance criteria and generate test cases.")
+
+
+# -----------------------------
+# 0.1) Unicode cleanup to avoid surrogate errors
+# -----------------------------
+_SURROGATES = re.compile(r"[\ud800-\udfff]")  # invalid UTF-8 surrogate range
+
+def clean_text(s: str) -> str:
+    """
+    Removes invalid surrogate characters that break UTF-8 encoding.
+    Also applies a safe encode/decode pass to replace any remaining odd chars.
+    """
+    s = s or ""
+    s = _SURROGATES.sub("", s)
+    return s.encode("utf-8", "replace").decode("utf-8")
 
 
 # -----------------------------
 # 1) OpenAI key handling (robust for Streamlit)
 # -----------------------------
-
-# to read from .env file 
-from dotenv import load_dotenv
-load_dotenv()
-
 def get_openai_key() -> str:
-    """
-    Order of preference:
-    1) Streamlit secrets (Streamlit Cloud / deployed)
-    2) Environment variable (VM/Docker)
-    """
     key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY", None)
 
     if not key:
         st.error("OPENAI_API_KEY is missing. Set it in Streamlit Secrets or as an environment variable.")
         st.stop()
 
-    # Key must be a normal string (not a function/coroutine/callable)
     if not isinstance(key, str):
-        st.error("OPENAI_API_KEY is not a string. You likely passed a callable. Fix your secrets/env value.")
+        st.error("OPENAI_API_KEY is not a string. Fix your secrets/env value.")
         st.stop()
 
     key = key.strip()
@@ -90,17 +99,14 @@ def pdf_bytes_to_text(pdf_bytes: bytes) -> str:
     parts = []
     for page in reader.pages:
         t = page.extract_text() or ""
-        t = t.strip()
+        t = clean_text(t).strip()
         if t:
             parts.append(t)
     return "\n".join(parts)
 
 
 def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
-    """
-    Simple char-based chunking with overlap.
-    Good enough for a minimal RAG project.
-    """
+    text = clean_text(text)
     text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
     if not text:
         return []
@@ -115,13 +121,10 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[st
         if end == n:
             break
 
-    return [c for c in chunks if c.strip()]
+    return [clean_text(c) for c in chunks if c.strip()]
 
 
 def hash_pdfs(pdf_files) -> str:
-    """
-    Create a stable hash so we can cache the FAISS index and only rebuild when PDFs change.
-    """
     h = hashlib.sha256()
     for f in pdf_files:
         h.update(f.getvalue())
@@ -133,15 +136,15 @@ def hash_pdfs(pdf_files) -> str:
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def build_faiss_index(pdf_hash: str, pdf_bytes_list: List[bytes]) -> FAISS:
-    """
-    Cached by pdf_hash (so re-runs are fast).
-    """
     embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
     all_chunks = []
     for b in pdf_bytes_list:
         text = pdf_bytes_to_text(b)
         all_chunks.extend(chunk_text(text))
+
+    # final safety cleanup
+    all_chunks = [clean_text(c) for c in all_chunks if c.strip()]
 
     if not all_chunks:
         raise RuntimeError(
@@ -153,8 +156,10 @@ def build_faiss_index(pdf_hash: str, pdf_bytes_list: List[bytes]) -> FAISS:
 
 
 def retrieve_context(vs: FAISS, query: str, top_k: int = 6) -> str:
+    query = clean_text(query)
     docs = vs.similarity_search(query, k=top_k)
-    return "\n\n".join(d.page_content for d in docs)
+    ctx = "\n\n".join(d.page_content for d in docs)
+    return clean_text(ctx)
 
 
 # -----------------------------
@@ -185,12 +190,15 @@ def generate_test_suite(vs: FAISS, requirement: str, acceptance: str, num_cases:
     llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0.1, api_key=OPENAI_API_KEY)
     chain = ChatPromptTemplate.from_template(PROMPT) | llm.with_structured_output(TestSuite)
 
+    requirement = clean_text(requirement).strip()
+    acceptance = clean_text(acceptance).strip()
+
     query = f"{requirement}\n{acceptance}"
     context = retrieve_context(vs, query=query, top_k=top_k)
 
     suite = chain.invoke({
-        "requirement": requirement.strip(),
-        "acceptance_criteria": acceptance.strip(),
+        "requirement": requirement,
+        "acceptance_criteria": acceptance,
         "context": context,
         "num_cases": int(num_cases),
     })
@@ -199,13 +207,16 @@ def generate_test_suite(vs: FAISS, requirement: str, acceptance: str, num_cases:
     seen = set()
     deduped = []
     for tc in suite.test_cases:
-        t = tc.title.strip().lower()
-        if t and t not in seen:
-            seen.add(t)
+        title = clean_text(tc.title).strip()
+        key = title.lower()
+        if title and key not in seen:
+            # also sanitize title back into object
+            tc.title = title
+            seen.add(key)
             deduped.append(tc)
     suite.test_cases = deduped
 
-    suite.suite_name = (suite.suite_name or "").strip() or "Generated Test Suite"
+    suite.suite_name = clean_text((suite.suite_name or "").strip()) or "Generated Test Suite"
     return suite
 
 
@@ -235,7 +246,6 @@ with c2:
 
 generate_btn = st.button("Generate Test Cases", type="primary")
 
-# Helpful status when no PDFs
 if not pdf_files:
     st.info("Upload PDF(s) in the sidebar to begin.")
     st.stop()
@@ -267,7 +277,6 @@ if generate_btn:
 
         st.success(f"Generated {len(suite.test_cases)} test cases")
 
-        # Table
         df = pd.DataFrame([{
             "id": tc.id,
             "title": tc.title,
@@ -276,9 +285,9 @@ if generate_btn:
         } for tc in suite.test_cases])
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # Details view
         st.divider()
         st.subheader("Test Case Details")
+
         tc_id = st.selectbox("Select a test case", df["id"].tolist())
         tc = next(t for t in suite.test_cases if t.id == tc_id)
 
@@ -286,7 +295,7 @@ if generate_btn:
         st.write(f"**Type:** {tc.type} | **Priority:** {tc.priority}")
 
         if tc.preconditions:
-            st.write("**Preconditions:**", "; ".join(tc.preconditions))
+            st.write("**Preconditions:**", "; ".join(clean_text(p) for p in tc.preconditions))
 
         if tc.test_data:
             st.write("**Test Data:**")
@@ -294,11 +303,10 @@ if generate_btn:
 
         st.write("**Steps:**")
         for i, s in enumerate(tc.steps, 1):
-            st.write(f"{i}. {s.action}  \n   ✅ {s.expected_result}")
+            st.write(f"{i}. {clean_text(s.action)}  \n   ✅ {clean_text(s.expected_result)}")
 
         if tc.notes:
-            st.write("**Notes:**", tc.notes)
+            st.write("**Notes:**", clean_text(tc.notes))
 
     except Exception as e:
-        # Catch OpenAI errors, rate limits, schema issues, etc.
         st.error(f"Generation failed: {e}")
