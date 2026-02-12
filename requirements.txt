@@ -2,7 +2,8 @@ langchain
 langchain_openai
 langchain_community
 langchain_core
-dotenv
+python-dotenv
+faiss-cpu
 streamlit
 typing
 pypdf
