@@ -185,7 +185,7 @@ Rules:
 - Steps must be atomic and each step must include expected_result.
 - Avoid duplicates (unique titles).
 - If something is unclear, add a short note in notes (do not invent behavior).
-- test_data MUST be a list of objects like: [{"key":"...", "value":"..."}]
+- test_data MUST be a list of objects like: [{{"key":"...", "value":"..."}}]
 Return ONLY the JSON object matching the schema.
 """
 
