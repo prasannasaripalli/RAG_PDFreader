@@ -1,0 +1,10 @@
+langchain
+langchain_openai
+langchain_community
+langchain_core
+dotenv
+streamlit
+typing
+pypdf
+pydantic
+pandas
