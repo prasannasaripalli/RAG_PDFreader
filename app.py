@@ -5,8 +5,8 @@ import hashlib
 import streamlit as st
 import pandas as pd
 from pypdf import PdfReader
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Optional
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
@@ -31,10 +31,6 @@ st.caption("Upload PDF(s), paste acceptance criteria and generate test cases.")
 _SURROGATES = re.compile(r"[\ud800-\udfff]")  # invalid UTF-8 surrogate range
 
 def clean_text(s: str) -> str:
-    """
-    Removes invalid surrogate characters that break UTF-8 encoding.
-    Also applies a safe encode/decode pass to replace any remaining odd chars.
-    """
     s = s or ""
     s = _SURROGATES.sub("", s)
     return s.encode("utf-8", "replace").decode("utf-8")
@@ -68,25 +64,33 @@ OPENAI_MODEL = st.secrets.get("OPENAI_MODEL", None) or os.getenv("OPENAI_MODEL",
 
 # -----------------------------
 # 2) Schema (consistent output)
+# IMPORTANT: extra="forbid" makes additionalProperties=false for OpenAI schema
+# IMPORTANT: test_data is NOT a dict (free-form dict breaks strict schema). Use list of key/value.
 # -----------------------------
 class Step(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     action: str
     expected_result: str
 
+class TestDataItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str
+    value: str
 
 class TestCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     id: str
     title: str
     type: str = Field(..., description="functional|negative|boundary|regression|api|ui")
     priority: str = Field(..., description="P0|P1|P2")
     preconditions: List[str] = []
-    test_data: Dict[str, Any] = {}
+    test_data: List[TestDataItem] = []     # ✅ changed from Dict[str, Any]
     steps: List[Step] = []
     tags: List[str] = []
     notes: Optional[str] = None
 
-
 class TestSuite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     suite_name: str
     test_cases: List[TestCase]
 
@@ -143,7 +147,6 @@ def build_faiss_index(pdf_hash: str, pdf_bytes_list: List[bytes]) -> FAISS:
         text = pdf_bytes_to_text(b)
         all_chunks.extend(chunk_text(text))
 
-    # final safety cleanup
     all_chunks = [clean_text(c) for c in all_chunks if c.strip()]
 
     if not all_chunks:
@@ -182,6 +185,7 @@ Rules:
 - Steps must be atomic and each step must include expected_result.
 - Avoid duplicates (unique titles).
 - If something is unclear, add a short note in notes (do not invent behavior).
+- test_data MUST be a list of objects like: [{"key":"...", "value":"..."}]
 Return ONLY the JSON object matching the schema.
 """
 
@@ -210,7 +214,6 @@ def generate_test_suite(vs: FAISS, requirement: str, acceptance: str, num_cases:
         title = clean_text(tc.title).strip()
         key = title.lower()
         if title and key not in seen:
-            # also sanitize title back into object
             tc.title = title
             seen.add(key)
             deduped.append(tc)
@@ -299,7 +302,7 @@ if generate_btn:
 
         if tc.test_data:
             st.write("**Test Data:**")
-            st.json(tc.test_data)
+            st.json({item.key: item.value for item in tc.test_data})
 
         st.write("**Steps:**")
         for i, s in enumerate(tc.steps, 1):
