@@ -136,9 +136,7 @@ def build_faiss_index(pdf_hash: str, pdf_bytes_list: List[bytes]) -> FAISS:
 
     all_chunks = [clean_text(c) for c in all_chunks if c.strip()]
     if not all_chunks:
-        raise RuntimeError(
-            "No text could be extracted from the PDF(s). If scanned images, OCR is required."
-        )
+        raise RuntimeError("No text could be extracted from the PDF(s). If scanned images, OCR is required.")
 
     return FAISS.from_texts(all_chunks, embeddings)
 
@@ -225,6 +223,8 @@ with st.sidebar:
     if st.button("Clear results"):
         st.session_state.suite = None
         st.session_state.selected_tc_id = None
+        st.session_state.pop("tc_selectbox", None)  # important: reset widget state
+        st.rerun()
 
 
 c1, c2 = st.columns(2)
@@ -263,70 +263,77 @@ if generate_btn:
         with st.spinner("Generating test cases..."):
             st.session_state.suite = generate_test_suite(vs, requirement, acceptance, num_cases)
 
-        if not st.session_state.suite.test_cases:
+        suite_obj = st.session_state.get("suite", None)
+        if suite_obj is None or not suite_obj.test_cases:
             st.warning("No test cases generated. Try increasing num_cases or improving acceptance criteria.")
             st.session_state.suite = None
+            st.session_state.selected_tc_id = None
+            st.session_state.pop("tc_selectbox", None)
             st.stop()
 
-        # Set default selection
-        st.session_state.selected_tc_id = st.session_state.suite.test_cases[0].id
-        st.success(f"Generated {len(st.session_state.suite.test_cases)} test cases")
+        # Set default selection AFTER generation
+        st.session_state.selected_tc_id = suite_obj.test_cases[0].id
+        st.session_state["tc_selectbox"] = st.session_state.selected_tc_id
+
+        st.success(f"Generated {len(suite_obj.test_cases)} test cases")
 
     except Exception as e:
         st.error(f"Generation failed: {e}")
         st.stop()
 
-# Render from session_state (so selection doesn't wipe results)
+
+# -----------------------------
+# SAFE Render from session_state (no st.stop dependency)
+# -----------------------------
 suite = st.session_state.get("suite", None)
-if not suite:
+
+if suite is None:
     st.info("Click **Generate Test Cases** after uploading PDFs.")
-    st.stop()
+else:
+    st.subheader(suite.suite_name)
 
-st.subheader(suite.suite_name)
+    df = pd.DataFrame([{
+        "id": tc.id,
+        "title": tc.title,
+        "type": tc.type,
+        "priority": tc.priority
+    } for tc in suite.test_cases])
 
-df = pd.DataFrame([{
-    "id": tc.id,
-    "title": tc.title,
-    "type": tc.type,
-    "priority": tc.priority
-} for tc in suite.test_cases])
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-st.dataframe(df, use_container_width=True, hide_index=True)
+    ids = df["id"].tolist()
+    if not ids:
+        st.warning("No test cases available. Generate again.")
+    else:
+        if st.session_state.get("selected_tc_id") not in ids:
+            st.session_state.selected_tc_id = ids[0]
+            st.session_state["tc_selectbox"] = ids[0]
 
-ids = df["id"].tolist()
-if not ids:
-    st.warning("No test cases available. Generate again.")
-    st.stop()
+        tc_id = st.selectbox(
+            "Select test case",
+            ids,
+            index=ids.index(st.session_state.selected_tc_id),
+            key="tc_selectbox"
+        )
+        st.session_state.selected_tc_id = tc_id
 
-# Keep selection stable across reruns
-if st.session_state.selected_tc_id not in ids:
-    st.session_state.selected_tc_id = ids[0]
+        tc = next(t for t in suite.test_cases if t.id == tc_id)
 
-tc_id = st.selectbox(
-    "Select test case",
-    ids,
-    index=ids.index(st.session_state.selected_tc_id),
-    key="tc_selectbox"
-)
-st.session_state.selected_tc_id = tc_id
+        st.divider()
+        st.subheader("Test Case Details")
+        st.markdown(f"### {tc.id}: {tc.title}")
+        st.write(f"**Type:** {tc.type} | **Priority:** {tc.priority}")
 
-tc = next(t for t in suite.test_cases if t.id == tc_id)
+        if tc.preconditions:
+            st.write("**Preconditions:**", "; ".join(clean_text(p) for p in tc.preconditions))
 
-st.divider()
-st.subheader("Test Case Details")
-st.markdown(f"### {tc.id}: {tc.title}")
-st.write(f"**Type:** {tc.type} | **Priority:** {tc.priority}")
+        if tc.test_data:
+            st.write("**Test Data:**")
+            st.json({item.key: item.value for item in tc.test_data})
 
-if tc.preconditions:
-    st.write("**Preconditions:**", "; ".join(clean_text(p) for p in tc.preconditions))
+        st.write("**Steps:**")
+        for i, s in enumerate(tc.steps, 1):
+            st.write(f"{i}. {clean_text(s.action)}  \n   ✅ {clean_text(s.expected_result)}")
 
-if tc.test_data:
-    st.write("**Test Data:**")
-    st.json({item.key: item.value for item in tc.test_data})
-
-st.write("**Steps:**")
-for i, s in enumerate(tc.steps, 1):
-    st.write(f"{i}. {clean_text(s.action)}  \n   ✅ {clean_text(s.expected_result)}")
-
-if tc.notes:
-    st.write("**Notes:**", clean_text(tc.notes))
+        if tc.notes:
+            st.write("**Notes:**", clean_text(tc.notes))
